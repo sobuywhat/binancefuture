@@ -831,13 +831,16 @@ def get_futures_open_orders(symbol: str) -> list:
         return []
 
 def get_futures_open_algo_orders(symbol: str) -> list:
-    """선물 Algo 미체결 조회 (GET fapi/v1/openAlgoOrders). STOP_MARKET 등 조건부 SL/TP는 여기만 있음."""
+    """선물 Algo 미체결 조회 (GET fapi/v1/openAlgoOrders). STOP_MARKET 등 조건부 SL/TP는 여기만 있음.
+    응답이 딕셔너리({'orders': [...]})인 경우와 리스트([])인 경우 모두 처리."""
     try:
         headers, signature, timestamp, recv_window = _binance_fapi_headers(f"symbol={symbol}")
         query_signed = f"symbol={symbol}&timestamp={timestamp}&recvWindow={recv_window}&signature={signature}"
         r = requests.get(f"{BINANCE_FUTURES_BASE}/fapi/v1/openAlgoOrders?{query_signed}", headers=headers, timeout=10)
         if r.status_code == 200:
             data = r.json()
+            if isinstance(data, dict):
+                return data.get("orders", [])
             return data if isinstance(data, list) else []
         return []
     except Exception as e:
@@ -1158,7 +1161,8 @@ def check_and_move_sl_to_be(symbol: str, stage_prefix: str = ""):
         tp_orders = [o for o in open_orders if (o.get("type") or "").upper() == "LIMIT" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
         # SL은 Algo Order API로만 등록되므로 openAlgoOrders에서 조회 (triggerPrice 사용)
         open_algo = get_futures_open_algo_orders(symbol)
-        sl_orders = [o for o in open_algo if (o.get("orderType") or "").upper() == "STOP_MARKET" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
+        # Algo 응답은 orderType 또는 type 키로 주문 유형 전달 (API/버전에 따라 다름)
+        sl_orders = [o for o in open_algo if (o.get("orderType") or o.get("type") or "").upper() == "STOP_MARKET" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
         if len(sl_orders) == 0:
             return
         if len(tp_orders) >= 3:
@@ -13779,8 +13783,8 @@ def analyze_15m_trading_performance():
     discord_msg_buffer = []
     
     # ---------- 헤더 형식 (사용자 정의, $=USDT 기준) ----------
-    #   [TotalUSDT]$=[totalWalletBalance]$+B[BNB USDT환산]$+[totalUnrealizedProfit]$([pct]%) |A: [availableBalance]$,L: [포지션증거금]$
-    #   예: 3003.05$=2988.99$+B14$+0.06$(+0.00%) |A: 2982.79$,L: 6.26$
+    #   [지갑+미실현]$=[지갑]$+[미실현]$([pct]%) |A: [가용]$,L: [포지션증거금]$,B: [BNB USDT환산]$
+    #   예: 2970.92$=2970.76$+0.16$(+0.01%) |A: 2952.38$,L: 18.53$,B: 5.67$
     # ----------
     acc = get_futures_account()
     total_wallet = float(acc.get("totalWalletBalance", 0) or 0)
@@ -13816,12 +13820,12 @@ def analyze_15m_trading_performance():
                 bnb_usdt_header = bnb_wallet * float(bnb_price)
         except Exception:
             pass
-    # TotalUSDT = USDT Wallet + BNB(USDT 환산) + 미실현 PnL
-    total_usdt_with_bnb = total_wallet + bnb_usdt_header + total_unrealized
+    # 왼쪽 첫 숫자 = 지갑 + 미실현 (BNB 제외). 끝에 B: BNB USDT 환산
+    total_with_unrealized = total_wallet + total_unrealized
     header_content = (
-        f" {total_usdt_with_bnb:.2f}$"
-        f"={total_wallet:.2f}$+B{bnb_usdt_header:.2f}${total_unrealized:+.2f}$({unrealized_pct:+.2f}%)"
-        f" |A: {available:.2f}$,L: {total_margin:.2f}$"
+        f" {total_with_unrealized:.2f}$"
+        f"={total_wallet:.2f}${total_unrealized:+.2f}$({unrealized_pct:+.2f}%)"
+        f" |A: {available:.2f}$,L: {total_margin:.2f}$,B: {bnb_usdt_header:.2f}$"
     )
     header_msg = get_timestamp() + header_content
     print(f"\n{separator}")
@@ -13902,10 +13906,11 @@ def analyze_15m_trading_performance():
                     open_algo = get_futures_open_algo_orders(symbol)
                 except Exception:
                     open_algo = []
+                # Algo 응답: orderType 또는 type 키 사용 (API/버전에 따라 다름)
                 sl_orders = [
                     o
                     for o in open_algo
-                    if (o.get("orderType") or "").upper() == "STOP_MARKET"
+                    if (o.get("orderType") or o.get("type") or "").upper() == "STOP_MARKET"
                     and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")
                 ]
                 if sl_orders and entry > 0:
