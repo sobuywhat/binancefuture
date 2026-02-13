@@ -190,9 +190,11 @@ FUTURES_STEP_TOTAL_PER_10K = 30
 FUTURES_STEP_TP_PER_10K = 10
 FUTURES_MIN_QTY_BTC = 0.001
 FUTURES_MIN_NOTIONAL_USDT = 5    # 거래소 최소 주문 금액(참고), 진입은 아래 금액 사용
-FUTURES_POSITION_USDT = 725      # BTC, ETH, XRP, SOL 진입 725 USDT
-FUTURES_TP_PART_USDT = 100       # 25%×3 TP: 각 100 USDT (나머지 25% = 100 USDT 추세전환까지 유지)
-FUTURES_BNB_TOTAL_USDT = 100     # BNB만 진입 100 USDT
+# 수수료용 BNB 현물 제외 마진 밸런스 3000 USDT 기준 = 4×725+100. 4개 티커 동적: 잔고≥3000 → (잔고-100)/4, 잔고<3000 → 725
+FUTURES_MARGIN_BASELINE_USDT = 3000
+FUTURES_POSITION_USDT = 725      # 4개 티커 기본 진입(잔고<3000일 때)
+FUTURES_TP_PART_USDT = 100       # 25%×3 TP 기준(725 기준 시 각 100). 동적 진입 시 비율 유지
+FUTURES_BNB_TOTAL_USDT = 100     # BNB만 고정 100 USDT
 FUTURES_BNB_TP_PART_USDT = 25    # BNB 4분할: 25%×3 = 각 25 USDT TP, 나머지 25% 유지 (25 USDT ≥ 거래소 최소)
 FUTURES_SL_PERCENT = 0.012      # SL 1.2% 3분할 (진입가 대비, 롱/숏 모두)
 # BE(Break-Even) 이동: 1차 익절(TP 1/3) 체결 시 남은 물량 SL을 '진입가 + 왕복 수수료'로 이동.
@@ -762,7 +764,7 @@ def print_futures_exchange_info_summary():
     """5개 티커(BTC,ETH,XRP,SOL,BNB) 선물 exchangeInfo 호출값 정리 → 터미널 출력 + 디스코드 전송."""
     separator = "=" * 80
     lines = []
-    header = f"{get_timestamp()} 📋 선물 exchangeInfo (5개 티커) minQty | stepSize | notional(USDT) | qtyPrec | pricePrec"
+    header = f"{get_timestamp()} exchangeInfo minQty | stepSize | notional | qtyPrec | pricePrec"
     lines.append(header)
     for ticker in ROTATION_TICKERS:
         symbol = f"{ticker}USDT"
@@ -802,7 +804,7 @@ def get_futures_position_risk(symbol: str) -> list:
     return data if isinstance(data, list) else []
 
 def cancel_all_futures_orders(symbol: str) -> bool:
-    """선물 미체결 주문 전량 취소 (DELETE fapi/v1/allOpenOrders)"""
+    """선물 일반 미체결 주문 전량 취소 (DELETE fapi/v1/allOpenOrders). Algo 주문은 별도 취소 필요."""
     try:
         headers, signature, timestamp, recv_window = _binance_fapi_headers(f"symbol={symbol}")
         query_signed = f"symbol={symbol}&timestamp={timestamp}&recvWindow={recv_window}&signature={signature}"
@@ -814,6 +816,23 @@ def cancel_all_futures_orders(symbol: str) -> bool:
         return False
     except Exception as e:
         print(f"{get_timestamp()} ❌ 선물 주문 취소 실패: {e}")
+        return False
+
+def cancel_all_futures_algo_orders(symbol: str) -> bool:
+    """선물 Algo 미체결 주문 전량 취소 (STOP_MARKET 등 유령 SL/TP 정리)."""
+    try:
+        orders = get_futures_open_algo_orders(symbol)
+        if not orders:
+            return True
+        for o in orders:
+            aid = o.get("algoId")
+            if aid is not None:
+                cancel_futures_algo_order(int(aid))
+        if orders:
+            print(f"{get_timestamp()} ✅ 선물 Algo 주문 {len(orders)}개 취소: {symbol}")
+        return True
+    except Exception as e:
+        print(f"{get_timestamp()} ⚠️ 선물 Algo 주문 취소 실패: {e}")
         return False
 
 def get_futures_open_orders(symbol: str) -> list:
@@ -832,7 +851,7 @@ def get_futures_open_orders(symbol: str) -> list:
 
 def get_futures_open_algo_orders(symbol: str) -> list:
     """선물 Algo 미체결 조회 (GET fapi/v1/openAlgoOrders). STOP_MARKET 등 조건부 SL/TP는 여기만 있음.
-    응답이 딕셔너리({'orders': [...]})인 경우와 리스트([])인 경우 모두 처리."""
+    바이낸스는 {"orders": [...], "total": N} 형태로 반환하므로 dict면 data.get("orders", []) 사용."""
     try:
         headers, signature, timestamp, recv_window = _binance_fapi_headers(f"symbol={symbol}")
         query_signed = f"symbol={symbol}&timestamp={timestamp}&recvWindow={recv_window}&signature={signature}"
@@ -1026,17 +1045,30 @@ def execute_futures_strategy(ls_signal: int, symbol: str = None, stage_prefix: s
         position_usdt, tp_stage_usdt = get_futures_position_params(ref_K)
         position_usdt = round(float(position_usdt), 2)
         tp_stage_usdt = round(float(tp_stage_usdt), 2)
-        # BNB: 진입 100 USDT, 4분할(25%×3 TP + 25% 추세전환까지 유지). 그 외: 725 USDT, 25%×3 TP + 25% 유지
+        # BNB: 고정 100 USDT. 그 외 4개 티커: 마진 밸런스(수수료용 BNB 제외) 기준 동적 진입
         if symbol == "BNBUSDT":
             position_usdt = float(FUTURES_BNB_TOTAL_USDT)
             tp_stage_usdt = round(float(FUTURES_BNB_TP_PART_USDT), 2)
         else:
-            position_usdt = float(FUTURES_POSITION_USDT)
-            tp_stage_usdt = round(float(FUTURES_TP_PART_USDT), 2)
+            # 헤더 맨 앞 값과 동일: 지갑 + 미실현 = 선물 계정 USDT 기준 자산(마진 밸런스)
+            try:
+                acc = get_futures_account()
+                total_wallet = float(acc.get("totalWalletBalance", 0) or 0)
+                total_unrealized = float(acc.get("totalUnrealizedProfit", 0) or 0)
+                margin_balance = total_wallet + total_unrealized
+            except Exception:
+                margin_balance = 0.0
+            if margin_balance < FUTURES_MARGIN_BASELINE_USDT:
+                position_usdt = float(FUTURES_POSITION_USDT)
+            else:
+                position_usdt = round((margin_balance - FUTURES_BNB_TOTAL_USDT) / 4, 2)
+            # TP 분할은 진입 대비 비율 유지 (725 기준 100 → position_usdt * (100/725))
+            tp_stage_usdt = round(position_usdt * (float(FUTURES_TP_PART_USDT) / float(FUTURES_POSITION_USDT)), 2)
         if position_usdt < notional:
             print(f"{get_timestamp()} [{stage_prefix}] ❌ 진입 금액 부족: {position_usdt} USDT < 거래소 최소 주문금액 {notional} USDT")
             return
         cancel_all_futures_orders(symbol)
+        cancel_all_futures_algo_orders(symbol)
         close_current_position(symbol)
         # 롱/숏 전부 1배만 사용
         set_futures_leverage(symbol, leverage=1)
@@ -1097,43 +1129,61 @@ def execute_futures_strategy(ls_signal: int, symbol: str = None, stage_prefix: s
             return
         tp_side = "SELL" if side == "BUY" else "BUY"
         if n_tps >= 1:
+            # 33% / 33% / 34%(나머지) 동일 비율 — BNB·다른 티커 공통 (짜투리 방지)
             if n_tps == 1:
-                tp_unit_qty = tp_total_qty
+                tp_qty_list = [tp_total_qty]
             else:
-                tp_unit_qty = _round_down_to_step((tp_total_qty - min_qty_per_tp) / (n_tps - 1), step_size)
-                if tp_unit_qty < min_qty_per_tp:
-                    tp_unit_qty = min_qty_per_tp
-            for i in range(n_tps):
+                third = _round_down_to_step(tp_total_qty / 3, step_size)
+                part1 = max(min_qty_per_tp, third)
+                part2 = max(min_qty_per_tp, third)
+                part3 = tp_total_qty - part1 - part2
+                if part3 < min_qty_per_tp:
+                    part2 += part3
+                    tp_qty_list = [part1, part2]  # 2개만
+                else:
+                    tp_qty_list = [part1, part2, part3]
+            for i in range(min(n_tps, len(tp_qty_list))):
+                qty_this = tp_qty_list[i]
                 pct = step_pct * (i + 1)
                 tp_price = entry_price * (1.0 + pct if side == "BUY" else 1.0 - pct)
                 tp_price = adjust_price_to_tick_futures(symbol, tp_price)
-                qty_this = (tp_total_qty - tp_unit_qty * (n_tps - 1)) if i == n_tps - 1 else tp_unit_qty
                 if qty_this >= min_qty and qty_this * tp_price >= notional_min:
                     binance_fapi_order(symbol, tp_side, qty_this, price=tp_price, order_type="LIMIT", reduce_only=True)
         else:
             print(f"{get_timestamp()} [{stage_prefix}] ⚠️ TP 0개 (min notional {notional_min} USDT·minQty {min_qty} 충족 불가), 전량 유지")
-        # SL 1.2% 3분할, 롱/숏 모두. 숏=진입가 상승 1.2% 트리거, 롱=진입가 하락 1.2% 트리거
-        sl_res = None
-        sl_price = entry_price * (1.0 + FUTURES_SL_PERCENT) if side == "SELL" else entry_price * (1.0 - FUTURES_SL_PERCENT)
-        sl_price = adjust_price_to_tick_futures(symbol, sl_price)
-        min_sl_qty = max(min_qty, _round_up_to_step(notional_min / sl_price, step_size))
+        # 신규 진입 SL 등록 시 기존 BE 저장가 초기화 (표시에서 BE 인식은 '우리가 넣은 가격'만 사용)
+        _be_trigger_price_by_symbol.pop(symbol, None)
+        # SL 3분할: 수량 33% / 33% / 34%(나머지) + 가격 0.6% / 0.8% / 1.0% (BNB·다른 티커 동일)
+        sl_pcts = (0.006, 0.008, 0.01)  # 0.6%, 0.8%, 1.0%
         n_sls = 3
-        if total_qty >= n_sls * min_sl_qty:
-            sl_unit_qty = _round_down_to_step((total_qty - min_sl_qty) / (n_sls - 1), step_size)
-            if sl_unit_qty < min_sl_qty:
-                sl_unit_qty = min_sl_qty
-            for i in range(n_sls):
-                sl_qty = (total_qty - sl_unit_qty * (n_sls - 1)) if i == n_sls - 1 else sl_unit_qty
-                if sl_qty >= min_sl_qty:
+        sl_res = None
+        if total_qty >= n_sls * min_qty:
+            third = _round_down_to_step(total_qty / 3, step_size)
+            sl_part1 = max(min_qty, third)
+            sl_part2 = max(min_qty, third)
+            sl_part3 = total_qty - sl_part1 - sl_part2
+            if sl_part3 < min_qty:
+                sl_part2 += sl_part3
+                sl_qty_list = [sl_part1, sl_part2]
+            else:
+                sl_qty_list = [sl_part1, sl_part2, sl_part3]
+            for i in range(len(sl_qty_list)):
+                sl_qty = sl_qty_list[i]
+                pct = sl_pcts[i]
+                sl_price = entry_price * (1.0 - pct if side == "BUY" else 1.0 + pct)
+                sl_price = adjust_price_to_tick_futures(symbol, sl_price)
+                if sl_qty >= min_qty and sl_qty * sl_price >= notional_min:
                     sl_res = binance_fapi_stop_market(symbol, tp_side, sl_qty, sl_price, reduce_only=True)
                     if sl_res:
-                        print(f"{get_timestamp()} [{stage_prefix}] 🛑 손절(SL {FUTURES_SL_PERCENT*100:.1f}% 3분할 {i+1}/{n_sls}) 예약: {tp_side} {sl_qty} @ 트리거 {sl_price}")
+                        print(f"{get_timestamp()} [{stage_prefix}] 🛑 손절(SL {pct*100:.1f}% 3분할 {i+1}/{len(sl_qty_list)}) 예약: {tp_side} {sl_qty} @ 트리거 {sl_price}")
         else:
+            sl_price = entry_price * (1.0 - sl_pcts[-1] if side == "BUY" else 1.0 + sl_pcts[-1])
+            sl_price = adjust_price_to_tick_futures(symbol, sl_price)
             sl_res = binance_fapi_stop_market(symbol, tp_side, total_qty, sl_price, reduce_only=True)
             if sl_res:
-                print(f"{get_timestamp()} [{stage_prefix}] 🛑 손절(SL {FUTURES_SL_PERCENT*100:.1f}%) 예약: {tp_side} {total_qty} @ 트리거 {sl_price}")
+                print(f"{get_timestamp()} [{stage_prefix}] 🛑 손절(SL {sl_pcts[-1]*100:.1f}%) 예약: {tp_side} {total_qty} @ 트리거 {sl_price}")
         tp_desc = f"TP {tp_range_str} {n_max_tps}분할"
-        sl_desc = f"SL {FUTURES_SL_PERCENT*100:.1f}% 3분할"
+        sl_desc = "SL 0.6/0.8/1.0% 3분할"
         print(f"{get_timestamp()} [{stage_prefix}] ✅ {tp_desc} + {sl_desc} 예약 완료")
     except Exception as e:
         print(f"{get_timestamp()} [{stage_prefix}] ❌ 전략 실행 중 오류: {e}")
@@ -1146,7 +1196,7 @@ def check_and_move_sl_to_be(symbol: str, stage_prefix: str = ""):
     바이낸스 선물 BNB 할인 기준: 롱=진입가+0.06%에서 매도, 숏=진입가-0.06%에서 매수 트리거."""
     try:
         positions = get_futures_position_risk(symbol)
-        entry_price, position_amt, side = None, 0.0, None
+        entry_price, position_amt, side, mark_price = None, 0.0, None, 0.0
         for pos in positions:
             amt = float(pos.get("positionAmt", 0) or 0)
             if amt == 0:
@@ -1154,62 +1204,52 @@ def check_and_move_sl_to_be(symbol: str, stage_prefix: str = ""):
             entry_price = float(pos.get("entryPrice", 0) or 0)
             position_amt = abs(amt)
             side = "BUY" if amt > 0 else "SELL"
+            mark_price = float(pos.get("markPrice", 0) or 0)
             break
         if entry_price is None or entry_price <= 0 or position_amt <= 0:
             return
         open_orders = get_futures_open_orders(symbol)
         tp_orders = [o for o in open_orders if (o.get("type") or "").upper() == "LIMIT" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
-        # SL은 Algo Order API로만 등록되므로 openAlgoOrders에서 조회 (triggerPrice 사용)
+        # SL: Algo(triggerPrice) + 예전 코드 일반 주문(stopPrice) 둘 다 조회
         open_algo = get_futures_open_algo_orders(symbol)
-        # Algo 응답은 orderType 또는 type 키로 주문 유형 전달 (API/버전에 따라 다름)
-        sl_orders = [o for o in open_algo if (o.get("orderType") or o.get("type") or "").upper() == "STOP_MARKET" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
+        sl_orders_algo = [o for o in open_algo if (o.get("type") or o.get("orderType") or "").upper() == "STOP_MARKET" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
+        sl_orders_old = [o for o in open_orders if (o.get("type") or "").upper() == "STOP_MARKET" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
+        sl_orders = sl_orders_algo if sl_orders_algo else sl_orders_old
         if len(sl_orders) == 0:
             return
-        if len(tp_orders) >= 3:
+        # 1차 TP 체결로 TP 개수 감소했거나, 수익이 0.5% 이상이면 BE 이동 (예전 코드 주문도 수익 나면 옮김)
+        profit_pct = (mark_price - entry_price) / entry_price if side == "BUY" else (entry_price - mark_price) / entry_price
+        if len(tp_orders) >= 3 and profit_pct < 0.005:
             return
-        first_sl_stop = float(sl_orders[0].get("triggerPrice", 0) or 0)
+        first_sl_stop = float(sl_orders[0].get("triggerPrice", 0) or sl_orders[0].get("stopPrice", 0) or 0)
         if first_sl_stop <= 0:
             return
-        # 실제 본절가 = 진입가 + 왕복 수수료 (0.06%). 롱=아래로 떨어질 때 진입+0.06%에서 매도, 숏=올라갈 때 진입-0.06%에서 매수
+        # 실제 본절가 = 진입가 + 왕복 수수료 (0.06%). 원래 SL = 0.6/0.8/1.0% 3단계
         be_long = entry_price * (1.0 + FUTURES_BE_OFFSET_PERCENT)
         be_short = entry_price * (1.0 - FUTURES_BE_OFFSET_PERCENT)
+        sl_pcts_be = (0.006, 0.008, 0.01)
+        orig_sl_levels = [entry_price * (1.0 - pct if side == "BUY" else 1.0 + pct) for pct in sl_pcts_be]
         tol_pct = 0.0005
-        if side == "BUY":
-            already_be = abs(first_sl_stop - be_long) / entry_price <= tol_pct
-            original_sl = entry_price * (1.0 - FUTURES_SL_PERCENT)
-            is_original = abs(first_sl_stop - original_sl) / entry_price <= tol_pct
-        else:
-            already_be = abs(first_sl_stop - be_short) / entry_price <= tol_pct
-            original_sl = entry_price * (1.0 + FUTURES_SL_PERCENT)
-            is_original = abs(first_sl_stop - original_sl) / entry_price <= tol_pct
+        already_be = (abs(first_sl_stop - (be_long if side == "BUY" else be_short)) / entry_price <= tol_pct)
+        is_original = any(abs(first_sl_stop - level) / entry_price <= tol_pct for level in orig_sl_levels)
         if already_be or not is_original:
             return
-        for o in sl_orders:
+        for o in sl_orders_algo:
             aid = o.get("algoId")
             if aid is not None:
                 cancel_futures_algo_order(int(aid))
-        info = get_futures_exchange_info(symbol, use_cache=False)
-        step_size = info["stepSize"]
-        min_qty = info["minQty"]
-        notional_min = float(info.get("notional", 5))
+        for o in sl_orders_old:
+            oid = o.get("orderId")
+            if oid is not None:
+                cancel_futures_order(symbol, int(oid))
         be_price = be_long if side == "BUY" else be_short
         be_price = adjust_price_to_tick_futures(symbol, be_price)
-        min_sl_qty = max(min_qty, _round_up_to_step(notional_min / be_price, step_size))
-        n_sls = 3
         tp_side = "SELL" if side == "BUY" else "BUY"
         disp_symbol = symbol.replace("USDT", "")
-        if position_amt >= n_sls * min_sl_qty:
-            sl_unit_qty = _round_down_to_step((position_amt - min_sl_qty) / (n_sls - 1), step_size)
-            if sl_unit_qty < min_sl_qty:
-                sl_unit_qty = min_sl_qty
-            for i in range(n_sls):
-                sl_qty = (position_amt - sl_unit_qty * (n_sls - 1)) if i == n_sls - 1 else sl_unit_qty
-                if sl_qty >= min_sl_qty:
-                    binance_fapi_stop_market(symbol, tp_side, sl_qty, be_price, reduce_only=True)
-            print(f"{get_timestamp()} [{stage_prefix}] 📌 (BEP) 이동: {disp_symbol} ({be_price:.4f})")
-        else:
-            binance_fapi_stop_market(symbol, tp_side, position_amt, be_price, reduce_only=True)
-            print(f"{get_timestamp()} [{stage_prefix}] 📌 (BEP) 이동: {disp_symbol} ({be_price:.4f})")
+        # BE는 1개 통 SL로 전량 (3분할 없음). 넣은 가격 저장 → 표시에서 그 가격으로 BE 인식
+        binance_fapi_stop_market(symbol, tp_side, position_amt, be_price, reduce_only=True)
+        _be_trigger_price_by_symbol[symbol] = be_price
+        print(f"{get_timestamp()} [{stage_prefix}] 📌 (BEP) 이동: {disp_symbol} ({be_price:.4f})")
     except Exception as e:
         print(f"{get_timestamp()} [{stage_prefix}] ⚠️ BE 이동 확인 중 오류: {e}")
 
@@ -7017,8 +7057,8 @@ def calculate_all_indicators_15m(df, market_type):
         df.loc[idx, "SMA400"] = df.iloc[idx:idx+400]["종"].mean() if idx + 400 <= len(df) else np.nan
         df.loc[idx, "SMA800"] = df.iloc[idx:idx+800]["종"].mean() if idx + 800 <= len(df) else np.nan
     
-    # SMAF: SMA3·SMA12 6:4 가중평균
-    df["SMAF"] = df["SMA3"] * 0.6 + df["SMA12"] * 0.4
+    # SMAF: SMA3·SMA12 66:34 가중평균
+    df["SMAF"] = df["SMA3"] * 0.66 + df["SMA12"] * 0.34
     
     # Max70, Min70 계산: 각 행(idx)에서 그 행부터 앞으로(과거로) 70개까지의 최고가/최저가
     for idx in range(len(df)):
@@ -8390,8 +8430,8 @@ def calculate_latest_row_only_15m(df, market_type):
     df.loc[idx, "SMA12"] = df.iloc[idx:idx+12]["종"].mean()
     sma3_v = df.loc[idx, "SMA3"]
     sma12_v = df.loc[idx, "SMA12"]
-    # SMAF: SMA3·SMA12 6:4 가중평균
-    df.loc[idx, "SMAF"] = (float(sma3_v) * 0.6 + float(sma12_v) * 0.4) if pd.notna(sma3_v) and pd.notna(sma12_v) else np.nan
+    # SMAF: SMA3·SMA12 66:34 가중평균
+    df.loc[idx, "SMAF"] = (float(sma3_v) * 0.66 + float(sma12_v) * 0.34) if pd.notna(sma3_v) and pd.notna(sma12_v) else np.nan
     df.loc[idx, "SMA20"] = df.iloc[idx:idx+20]["종"].mean()
     df.loc[idx, "SMA25"] = df.iloc[idx:idx+25]["종"].mean()
     df.loc[idx, "SMA50"] = df.iloc[idx:idx+50]["종"].mean()
@@ -13770,6 +13810,8 @@ def analyze_15m_performance(df_15m: pd.DataFrame, ticker: str) -> dict:
 
 # 4day 분석 시 티커별 LS·1HMSF·종가 표시용 (run_rotation_sequence에서 설정)
 _4day_ticker_snapshots = {}
+# BE 이동 시 넣은 트리거 가격 (표시에서 'BE' 인식용, 허용오차 없이 비교)
+_be_trigger_price_by_symbol = {}
 
 def analyze_15m_trading_performance():
     """
@@ -13781,6 +13823,18 @@ def analyze_15m_trading_performance():
     global _4day_ticker_snapshots
     separator = "=" * 100
     discord_msg_buffer = []
+    
+    # 포지션 없는 심볼의 유령 주문(일반+Algo) 정리
+    for _t in ROTATION_TICKERS:
+        symbol = f"{_t}USDT"
+        positions = get_futures_position_risk(symbol)
+        has_pos = any(float(p.get("positionAmt", 0) or 0) != 0 for p in positions)
+        if not has_pos:
+            open_ord = get_futures_open_orders(symbol)
+            open_algo = get_futures_open_algo_orders(symbol)
+            if open_ord or open_algo:
+                cancel_all_futures_orders(symbol)
+                cancel_all_futures_algo_orders(symbol)
     
     # ---------- 헤더 형식 (사용자 정의, $=USDT 기준) ----------
     #   [지갑+미실현]$=[지갑]$+[미실현]$([pct]%) |A: [가용]$,L: [포지션증거금]$,B: [BNB USDT환산]$
@@ -13897,52 +13951,44 @@ def analyze_15m_trading_performance():
                 tp1 = adjust_price_to_tick_futures(symbol, entry * (1.005 if amt > 0 else 0.995))
                 tp2 = adjust_price_to_tick_futures(symbol, entry * (1.01 if amt > 0 else 0.99))
                 tp3 = adjust_price_to_tick_futures(symbol, entry * (1.015 if amt > 0 else 0.985))
-                # L/BE 표시
-                # - 기본: SL 1.2% (롱=진입가 하락 1.2%, 숏=진입가 상승 1.2%)
-                # - BE 이동 후: L 대신 BE로 표시. SL은 Algo Order이므로 openAlgoOrders에서 triggerPrice 사용
+                sl1 = adjust_price_to_tick_futures(symbol, entry * (1.0 - 0.006 if amt > 0 else 1.0 + 0.006))
+                sl2 = adjust_price_to_tick_futures(symbol, entry * (1.0 - 0.008 if amt > 0 else 1.0 + 0.008))
+                sl3 = adjust_price_to_tick_futures(symbol, entry * (1.0 - 0.01 if amt > 0 else 1.0 + 0.01))
+                # L/BE 표시: TP1 달성 → BE(1개), 아니면 L(0.6/0.8/1.0% 3개) 또는 L*
                 l_label = "L"
                 sl_display = None
                 try:
                     open_algo = get_futures_open_algo_orders(symbol)
+                    open_orders = get_futures_open_orders(symbol)
                 except Exception:
                     open_algo = []
-                # Algo 응답: orderType 또는 type 키 사용 (API/버전에 따라 다름)
-                sl_orders = [
-                    o
-                    for o in open_algo
-                    if (o.get("orderType") or o.get("type") or "").upper() == "STOP_MARKET"
-                    and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")
-                ]
-                if sl_orders and entry > 0:
-                    first_sl_stop = float(sl_orders[0].get("triggerPrice", 0) or 0)
-                    if first_sl_stop > 0:
-                        tol_pct = 0.001  # 0.1% 이내면 동일 가격으로 간주
-                        if amt > 0:
-                            # 롱: 원래 SL = 진입가 * (1 - SL%), BE = 진입가 * (1 + BE_OFFSET)
-                            orig_sl = adjust_price_to_tick_futures(symbol, entry * (1.0 - FUTURES_SL_PERCENT))
-                            be_price = adjust_price_to_tick_futures(symbol, entry * (1.0 + FUTURES_BE_OFFSET_PERCENT))
-                        else:
-                            # 숏: 원래 SL = 진입가 * (1 + SL%), BE = 진입가 * (1 - BE_OFFSET)
-                            orig_sl = adjust_price_to_tick_futures(symbol, entry * (1.0 + FUTURES_SL_PERCENT))
-                            be_price = adjust_price_to_tick_futures(symbol, entry * (1.0 - FUTURES_BE_OFFSET_PERCENT))
-                        if abs(first_sl_stop - be_price) / entry <= tol_pct:
-                            # BE 상태
-                            l_label = "BE"
-                            sl_display = be_price
-                        elif abs(first_sl_stop - orig_sl) / entry <= tol_pct:
-                            # 원래 SL 상태
-                            l_label = "L"
-                            sl_display = orig_sl
-                        else:
-                            # 수동 조정 등: 실제 stopPrice를 그대로 표시
-                            sl_display = first_sl_stop
-                if sl_display is None:
-                    # SL 주문이 없으면 이론상 SL 기준으로 표시
-                    if amt > 0:
-                        sl_display = adjust_price_to_tick_futures(symbol, entry * (1.0 - FUTURES_SL_PERCENT))
+                    open_orders = []
+                tp_orders = [o for o in open_orders if (o.get("type") or "").upper() == "LIMIT" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
+                sl_orders_algo = [o for o in open_algo if (o.get("type") or o.get("orderType") or "").upper() == "STOP_MARKET" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
+                sl_orders_old = [o for o in open_orders if (o.get("type") or "").upper() == "STOP_MARKET" and (o.get("reduceOnly") in (True, "true", "TRUE") or str(o.get("reduceOnly", "")).lower() == "true")]
+                sl_orders = sl_orders_algo if sl_orders_algo else sl_orders_old
+                first_sl_stop = float(sl_orders[0].get("triggerPrice", 0) or sl_orders[0].get("stopPrice", 0) or 0) if sl_orders and entry > 0 else 0.0
+                be_computed = adjust_price_to_tick_futures(symbol, entry * (1.0 + FUTURES_BE_OFFSET_PERCENT if amt > 0 else -FUTURES_BE_OFFSET_PERCENT))
+                # TP1 달성(TP 미체결 3개 미만)이면 BE 표시
+                if len(tp_orders) < 3:
+                    l_label = "BE"
+                    sl_display = first_sl_stop if first_sl_stop > 0 else _be_trigger_price_by_symbol.get(symbol) or be_computed
+                elif sl_orders and entry > 0 and first_sl_stop > 0:
+                    tol_pct = 0.002
+                    sl_pcts_disp = (0.006, 0.008, 0.01)
+                    orig_levels = [adjust_price_to_tick_futures(symbol, entry * (1.0 - pct if amt > 0 else 1.0 + pct)) for pct in sl_pcts_disp]
+                    if any(abs(first_sl_stop - lev) / entry <= tol_pct for lev in orig_levels):
+                        l_label = "L"
                     else:
-                        sl_display = adjust_price_to_tick_futures(symbol, entry * (1.0 + FUTURES_SL_PERCENT))
-                sl_str = f"{sl_display:{pf}}"
+                        l_label = "L*"
+                        sl_display = first_sl_stop
+                if sl_display is None and l_label != "L":
+                    sl_display = sl1
+                # L일 때는 0.6/0.8/1.0% 세 가격 전부 표시, BE/L*는 단일 가격
+                if l_label == "L":
+                    sl_str = f"{sl1:{pf}}-{sl2:{pf}}-{sl3:{pf}}"
+                else:
+                    sl_str = f"{(sl_display or sl1):{pf}}"
                 line = (
                     f"[{ticker_display}] {side_short} {round(notional)}$ @{entry:{pf}} |M{mark_str} |{upnl:>+5.2f}$({upnl_pct:>+5.2f}%) |P{tp1:{pf}}-{tp2:{pf}}-{tp3:{pf}} |{l_label}{sl_str}"
                 )
@@ -13950,7 +13996,7 @@ def analyze_15m_trading_performance():
                 discord_msg_buffer.append(line)
             
             if not has_position:
-                line = f"[{ticker_display}] 포지션 없음"
+                line = f"[{ticker_display}] -"
                 print(f"{get_timestamp()} {line}")
                 discord_msg_buffer.append(line)
         except Exception as e:
