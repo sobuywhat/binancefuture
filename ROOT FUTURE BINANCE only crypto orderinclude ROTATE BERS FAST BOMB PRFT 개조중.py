@@ -1035,6 +1035,22 @@ def execute_futures_strategy(ls_signal, symbol: str = None, stage_prefix: str = 
         return
     ls_half = ls_val in (0.5, -0.5)  # 진입량 절반
     try:
+        # 0.5/-0.5 신호 시 같은 방향 포지션이 있으면 진입 스킵(기존 포지션 유지, 수수료 절감)
+        positions = get_futures_position_risk(symbol)
+        current_amt = 0.0
+        for pos in positions:
+            amt = float(pos.get("positionAmt", 0) or 0)
+            if amt != 0:
+                current_amt = amt
+                break
+        side = "BUY" if ls_val > 0 else "SELL"
+        if ls_half:
+            if side == "BUY" and current_amt > 0:
+                print(f"{get_timestamp()} [{stage_prefix}] [{symbol}] LS 0.5 신호 발생했으나 이미 롱 포지션 보유 중 - 주문 스킵")
+                return
+            if side == "SELL" and current_amt < 0:
+                print(f"{get_timestamp()} [{stage_prefix}] [{symbol}] LS -0.5 신호 발생했으나 이미 숏 포지션 보유 중 - 주문 스킵")
+                return
         current_price = float(binance_fapi_ticker_price(symbol))
         if current_price <= 0:
             print(f"{get_timestamp()} [{stage_prefix}] ❌ 선물 현재가 조회 실패")
@@ -1104,7 +1120,7 @@ def execute_futures_strategy(ls_signal, symbol: str = None, stage_prefix: str = 
             print(f"{get_timestamp()} [{stage_prefix}] ❌ 잔고 또는 금액 부족으로 주문 불가 (필요 수량 {total_qty} < 최소 {min_qty})")
             return
         notional_min = float(info.get("notional", 5))
-        # 100% → TP 분할. TP 1.5% 3분할 (0.5% / 1.0% / 1.5%), 롱/숏 모두
+        # 100% → TP 분할. TP 0.5% / 1.0% / 1.5% (LS 1·-1·0.5·-0.5 동일)
         tp_total_qty = _round_down_to_step(total_qty * 1.0, step_size)
         held_qty = 0
         min_qty_per_tp = max(min_qty, _round_up_to_step(notional_min / entry_price, step_size))
@@ -1163,7 +1179,7 @@ def execute_futures_strategy(ls_signal, symbol: str = None, stage_prefix: str = 
             print(f"{get_timestamp()} [{stage_prefix}] ⚠️ TP 0개 (min notional {notional_min} USDT·minQty {min_qty} 충족 불가), 전량 유지")
         # 신규 진입 SL 등록 시 기존 BE 저장가 초기화 (표시에서 BE 인식은 '우리가 넣은 가격'만 사용)
         _be_trigger_price_by_symbol.pop(symbol, None)
-        # SL 3분할: 수량 33% / 33% / 34%(나머지) + 가격 0.6% / 0.8% / 1.0% (BNB·다른 티커 동일)
+        # SL 3분할: 수량 33/33/34% + 가격 0.6% / 0.8% / 1.0% (LS 1·-1·0.5·-0.5 동일)
         sl_pcts = (0.006, 0.008, 0.01)  # 0.6%, 0.8%, 1.0%
         n_sls = 3
         sl_res = None
