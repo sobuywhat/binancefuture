@@ -1018,17 +1018,22 @@ def binance_fapi_stop_market(symbol: str, side: str, quantity: float, stop_price
         print(f"{get_timestamp()} ❌ 선물 스탑마켓(SL) 주문 예외(Algo): {e}")
         return None
 
-def execute_futures_strategy(ls_signal: int, symbol: str = None, stage_prefix: str = "", K: float = None):
-    """LS 시그널(1 또는 -1)에 따른 선물 진입 및 3단계 분할 익절. K=LS 판정된 종가 → 스마트 주문 엔진으로 주문가 결정."""
+def execute_futures_strategy(ls_signal, symbol: str = None, stage_prefix: str = "", K: float = None):
+    """LS 시그널(1, -1, 0.5, -0.5)에 따른 선물 진입 및 3단계 분할 익절. 0.5/-0.5일 때는 진입량 절반. TP/SL/BE 동일."""
     if symbol is None:
         symbol = f"{TICKER}USDT"
     sym_upper = symbol.replace("USDT", "").upper()
     if sym_upper not in ROTATION_TICKERS:
         print(f"{get_timestamp()} [{stage_prefix}] 🔒 선물 잠금: {sym_upper} (선물 주문은 {ROTATION_TICKERS} 만 가능)")
         return
-    if ls_signal not in (1, -1):
-        print(f"{get_timestamp()} [{stage_prefix}] ⚠️ execute_futures_strategy: ls_signal은 1 또는 -1이어야 함 (현재: {ls_signal})")
+    try:
+        ls_val = float(ls_signal)
+    except (TypeError, ValueError):
+        ls_val = None
+    if ls_val not in (1.0, -1.0, 0.5, -0.5):
+        print(f"{get_timestamp()} [{stage_prefix}] ⚠️ execute_futures_strategy: ls_signal은 1, -1, 0.5, -0.5 중 하나 (현재: {ls_signal})")
         return
+    ls_half = ls_val in (0.5, -0.5)  # 진입량 절반
     try:
         current_price = float(binance_fapi_ticker_price(symbol))
         if current_price <= 0:
@@ -1064,6 +1069,10 @@ def execute_futures_strategy(ls_signal: int, symbol: str = None, stage_prefix: s
                 position_usdt = round((margin_balance - FUTURES_BNB_TOTAL_USDT) / 4, 2)
             # TP 분할은 진입 대비 비율 유지 (725 기준 100 → position_usdt * (100/725))
             tp_stage_usdt = round(position_usdt * (float(FUTURES_TP_PART_USDT) / float(FUTURES_POSITION_USDT)), 2)
+        # LS 0.5 / -0.5: 진입량·TP 스테이지 절반 (TP/SL/BE 로직은 동일)
+        if ls_half:
+            position_usdt = round(position_usdt * 0.5, 2)
+            tp_stage_usdt = round(tp_stage_usdt * 0.5, 2)
         if position_usdt < notional:
             print(f"{get_timestamp()} [{stage_prefix}] ❌ 진입 금액 부족: {position_usdt} USDT < 거래소 최소 주문금액 {notional} USDT")
             return
@@ -1079,7 +1088,7 @@ def execute_futures_strategy(ls_signal: int, symbol: str = None, stage_prefix: s
             entry_price = round(current_price, price_prec)
             smart_log_lines = []
         else:
-            is_buy = ls_signal == 1
+            is_buy = ls_val > 0
             entry_price, smart_log_lines = execute_smart_order(is_buy=is_buy, K=ref_K, ask=ask, bid=bid, ask_q=ask_q, bid_q=bid_q, symbol=symbol)
             if entry_price is None:
                 entry_price = round(current_price, price_prec)
@@ -1103,8 +1112,9 @@ def execute_futures_strategy(ls_signal: int, symbol: str = None, stage_prefix: s
         n_max_tps, step_pct, tp_range_str = 3, 0.015 / 3, "1.5% 3분할"   # step_pct=0.5% → 0.5%, 1.0%, 1.5%
         if n_tps > n_max_tps:
             n_tps = n_max_tps
-        side = "BUY" if ls_signal == 1 else "SELL"
-        print(f"{get_timestamp()} [{stage_prefix}] 🚀 신규 진입: {side} {total_qty} @ {entry_price} USDT (K={ref_K:.2f}, 진입 {position_usdt:.2f} USDT, 100% TP {tp_range_str} {n_tps}개)")
+        side = "BUY" if ls_val > 0 else "SELL"
+        half_note = " (LS 0.5/-0.5 절반)" if ls_half else ""
+        print(f"{get_timestamp()} [{stage_prefix}] 🚀 신규 진입: {side} {total_qty} @ {entry_price} USDT (K={ref_K:.2f}, 진입 {position_usdt:.2f} USDT, 100% TP {tp_range_str} {n_tps}개){half_note}")
         entry_res = binance_fapi_order(symbol, side, total_qty, price=entry_price, order_type="LIMIT")
         if not entry_res:
             return
@@ -7136,8 +7146,8 @@ def calculate_all_indicators_15m(df, market_type):
     # 각 행은 자신의 SMAF, SMA100, SMA200으로 계산 (shift 없음)
     df["1HMSFast"] = df.apply(lambda row: calculate_1hmsfast_15m(row["SMAF"], row["SMA100"], row["SMA200"]), axis=1)
     
-    # LS 열: -1 = (현재 2<1HMSF<3 AND 직전 1.5<1HMSF<=2) OR (현재 4<1HMSF<=5 AND 직전 5<1HMSF<6) / 1 = (5<현재<6 AND 직전 4~5) OR (1<현재<=2 AND 직전 2~3)
-    # 각 행(idx) = 2행, 다음 행(idx+1) = 3행. 최신→과거 순서이므로 idx+1이 과거(Excel 아래행).
+    # LS 열: -1/1 기존 + 0.5(롱약)/-0.5(숏약) 5가지씩 추가
+    # 각 행(idx) = 현재행, 다음 행(idx+1) = 직전행. 최신→과거 순서.
     df["LS"] = np.nan
     for i in range(len(df)):
         if i + 1 >= len(df):
@@ -7153,6 +7163,10 @@ def calculate_all_indicators_15m(df, market_type):
                     df.at[i, "LS"] = -1
                 elif (5 < h2_f < 6 and 4 < h3_f <= 5) or (1 < h2_f <= 2 and 2 < h3_f < 3):
                     df.at[i, "LS"] = 1
+                elif (6 < h2_f <= 7 and 5 < h3_f <= 6) or (7 < h2_f <= 7.5 and 6 < h3_f <= 7) or (3 < h2_f <= 4 and 4 < h3_f <= 5) or (2 < h2_f <= 3 and 3 < h3_f <= 4) or (6 < h2_f <= 7 and 4 < h3_f <= 5):
+                    df.at[i, "LS"] = 0.5
+                elif (5 < h2_f <= 6 and 6 < h3_f <= 7) or (6 < h2_f <= 7 and 7 < h3_f <= 7.5) or (4 < h2_f <= 5 and 3 < h3_f <= 4) or (3 < h2_f <= 4 and 2 < h3_f <= 3) or (4 < h2_f <= 5 and 6 < h3_f <= 7):
+                    df.at[i, "LS"] = -0.5
                 else:
                     df.at[i, "LS"] = np.nan
     
@@ -8485,7 +8499,7 @@ def calculate_latest_row_only_15m(df, market_type):
         df.loc[idx, "SMAF"], df.loc[idx, "SMA100"], df.loc[idx, "SMA200"]
     )
     
-    # LS 열: -1 = (현재 2<1HMSF<3 AND 직전 1.5<1HMSF<=2) OR (현재 4<1HMSF<=5 AND 직전 5<1HMSF<6) / 1 = (5<현재<6 AND 직전 4~5) OR (1<현재<=2 AND 직전 2~3)
+    # LS 열: -1/1 기존 + 0.5(롱약)/-0.5(숏약) 5가지씩 추가
     if idx + 1 < len(df):
         h2 = df.loc[idx, "1HMSFast"]
         h3 = df.loc[idx + 1, "1HMSFast"]
@@ -8495,6 +8509,10 @@ def calculate_latest_row_only_15m(df, market_type):
                 df.loc[idx, "LS"] = -1
             elif (5 < h2_f < 6 and 4 < h3_f <= 5) or (1 < h2_f <= 2 and 2 < h3_f < 3):
                 df.loc[idx, "LS"] = 1
+            elif (6 < h2_f <= 7 and 5 < h3_f <= 6) or (7 < h2_f <= 7.5 and 6 < h3_f <= 7) or (3 < h2_f <= 4 and 4 < h3_f <= 5) or (2 < h2_f <= 3 and 3 < h3_f <= 4) or (6 < h2_f <= 7 and 4 < h3_f <= 5):
+                df.loc[idx, "LS"] = 0.5
+            elif (5 < h2_f <= 6 and 6 < h3_f <= 7) or (6 < h2_f <= 7 and 7 < h3_f <= 7.5) or (4 < h2_f <= 5 and 3 < h3_f <= 4) or (3 < h2_f <= 4 and 2 < h3_f <= 3) or (4 < h2_f <= 5 and 6 < h3_f <= 7):
+                df.loc[idx, "LS"] = -0.5
             else:
                 df.loc[idx, "LS"] = np.nan
         else:
@@ -11653,8 +11671,8 @@ def main(polling_start_time=None, skip_first_row=False, pre_fetched_data=None):
             latest_ls = latest_row.get("LS", np.nan)
             if pd.notna(latest_ls):
                 try:
-                    ls_val = int(float(latest_ls))
-                    ls_str = f" | LS:{ls_val}"
+                    ls_val = float(latest_ls)
+                    ls_str = f" | LS:{ls_val}" if ls_val in (1.0, -1.0, 0.5, -0.5) else " | LS: -"
                 except (TypeError, ValueError):
                     ls_str = " | LS: -"
             else:
@@ -13167,18 +13185,18 @@ def main(polling_start_time=None, skip_first_row=False, pre_fetched_data=None):
                     latest_order = df_binance_ticker_15m.iloc[0].get("ORDER", "")
                     latest_ksc = df_binance_ticker_15m.iloc[0].get("KSC", 0)
                 
-                    # LS 시그널(1 또는 -1) 시 선물 전략 실행 — LS 판정된 종가(K)로 스마트 주문 엔진 사용
+                    # LS 시그널(1, -1, 0.5, -0.5) 시 선물 전략 실행. 0.5/-0.5는 진입량 절반. TP/SL/BE 동일.
                     if ENABLE_FUTURES_LS_STRATEGY:
                         latest_ls_raw = df_binance_ticker_15m.iloc[0].get("LS", "")
                         latest_ls = None
                         try:
                             if latest_ls_raw not in ("", None) and pd.notna(latest_ls_raw):
-                                v = int(float(latest_ls_raw))
-                                if v in (1, -1):
+                                v = float(latest_ls_raw)
+                                if v in (1.0, -1.0, 0.5, -0.5):
                                     latest_ls = v
                         except (TypeError, ValueError):
                             pass
-                        if latest_ls in (1, -1) and TICKER in ROTATION_TICKERS:
+                        if latest_ls is not None and latest_ls in (1.0, -1.0, 0.5, -0.5) and TICKER in ROTATION_TICKERS:
                             row0 = df_binance_ticker_15m.iloc[0]
                             K_close = row0.get("종", None)
                             try:
@@ -13897,8 +13915,8 @@ def analyze_15m_trading_performance():
                 s = _4day_ticker_snapshots[ticker]
                 ls_val = s.get("LS")
                 try:
-                    v = int(float(ls_val)) if ls_val is not None and ls_val != "" and not (hasattr(ls_val, "__float__") and pd.isna(ls_val)) else None
-                    ls_str = str(v) if v in (1, -1) else "-"
+                    v = float(ls_val) if ls_val is not None and ls_val != "" and not (hasattr(ls_val, "__float__") and pd.isna(ls_val)) else None
+                    ls_str = str(int(v)) if v in (1.0, -1.0) else (f"{v}" if v in (0.5, -0.5) else "-")
                 except (TypeError, ValueError):
                     ls_str = "-"
                 hmsf_val = s.get("1HMSFast")
